@@ -6,6 +6,7 @@ import type { TimeLineItem } from '../types'
 import {
   addDays,
   compareItems,
+  ensureImageSettings,
   formatDateLabel,
   formatEpisode,
   formatTimeRange,
@@ -51,7 +52,7 @@ const LEGENDS = [
   { color: 'warning', text: '上午' },
   { color: 'info', text: '下午' },
   { color: 'primary', text: '晚间' },
-  { color: '#7E57C2', text: '深夜' },
+  { color: '#3949AB', text: '深夜' },
   { color: 'secondary', text: '时间待定' },
 ]
 
@@ -81,10 +82,6 @@ let refreshTimers: ReturnType<typeof setTimeout>[] = []
 
 const monthLabel = computed(() => `${cursor.value.getFullYear()}年${cursor.value.getMonth() + 1}月`)
 
-const isCurrentMonth = computed(
-  () =>
-    cursor.value.getFullYear() === today.value.getFullYear() && cursor.value.getMonth() === today.value.getMonth(),
-)
 
 // 月历网格：周一为每周第一天
 const gridRange = computed(() => {
@@ -258,6 +255,7 @@ watch(gridRange, () => void loadEvents())
 
 onMounted(() => {
   window.addEventListener('resize', handleResize, { passive: true })
+  void ensureImageSettings(props.api)
   void loadEvents()
 })
 
@@ -298,7 +296,6 @@ onBeforeUnmount(() => {
             size="small"
             color="primary"
             class="ms-1"
-            :disabled="isCurrentMonth"
             @click="goToday"
           >
             今天
@@ -382,7 +379,11 @@ onBeforeUnmount(() => {
                 :class="{ 'sc-cell-event--obtained': item.downloaded }"
                 :title="cellTitle(item)"
               >
-                <v-img :src="getImageUrl(api, item.poster)" class="sc-cell-event__poster" cover aspect-ratio="0.667" />
+                <v-img :src="getImageUrl(api, item.poster)" class="sc-cell-event__poster" cover aspect-ratio="0.667">
+                  <template #error>
+                    <div class="sc-cell-event__fallback" />
+                  </template>
+                </v-img>
                 <div class="sc-cell-event__text">
                   <div class="sc-cell-event__name">{{ item.name || item.summary }}</div>
                   <div class="sc-cell-event__meta">
@@ -450,6 +451,11 @@ onBeforeUnmount(() => {
   flex-direction: column;
   gap: 0.75rem;
   padding: 1rem;
+}
+
+.sc-calendar:not(.sc-calendar--embedded) {
+  /* 预留 NEO 底部悬浮导航的空间 */
+  padding-block-end: 5.5rem;
 }
 
 .sc-calendar--embedded {
@@ -618,6 +624,11 @@ onBeforeUnmount(() => {
   inline-size: 1.25rem;
 }
 
+.sc-cell-event__fallback {
+  block-size: 100%;
+  background-color: rgba(var(--v-theme-on-surface), 0.12);
+}
+
 .sc-cell-event__text {
   flex: 1 1 auto;
   min-inline-size: 0;
@@ -625,6 +636,7 @@ onBeforeUnmount(() => {
 
 .sc-cell-event__name {
   overflow: hidden;
+  color: rgb(var(--v-theme-on-surface));
   font-size: 0.75rem;
   font-weight: 600;
   line-height: 1.25;
@@ -666,8 +678,8 @@ onBeforeUnmount(() => {
   background-color: rgb(var(--v-theme-secondary));
 }
 
-.sc-dot--7E57C2 {
-  background-color: #7e57c2;
+.sc-dot--3949AB {
+  background-color: #3949ab;
 }
 
 .sc-cell__more {

@@ -42,11 +42,11 @@ const DASHBOARD_SIZES = [
   { title: '全宽', value: 12 },
 ]
 
-const SWITCHES: { key: keyof PluginConfig; title: string; subtitle: string; icon: string }[] = [
-  { key: 'enabled', title: '启用插件', subtitle: '生成日历并开放 iCal 订阅', icon: 'mdi-power' },
-  { key: 'onlyonce', title: '立即刷新一次', subtitle: '保存后重新获取全部播出信息', icon: 'mdi-update' },
-  { key: 'calc_time', title: '推算播出时间', subtitle: '根据订阅下载记录推算具体时刻', icon: 'mdi-history' },
-  { key: 'sidebar_nav', title: '侧栏月历入口', subtitle: '在「订阅」分组显示月历页面', icon: 'mdi-dock-left' },
+const SWITCHES: { key: keyof PluginConfig; title: string; subtitle: string }[] = [
+  { key: 'enabled', title: '启用插件', subtitle: '生成日历并开放 iCal 订阅' },
+  { key: 'onlyonce', title: '立即刷新一次', subtitle: '保存后重新获取全部订阅的播出信息' },
+  { key: 'calc_time', title: '推算播出时间', subtitle: '根据订阅下载记录推算具体播出时刻' },
+  { key: 'sidebar_nav', title: '侧栏月历入口', subtitle: '在侧栏「订阅」分组显示订阅日历' },
 ]
 
 const form = ref<{ validate: () => Promise<{ valid: boolean }> } | null>(null)
@@ -159,11 +159,6 @@ onMounted(async () => {
 <template>
   <v-card flat class="sc-config">
     <v-card-item>
-      <template #prepend>
-        <v-avatar color="primary" variant="tonal" rounded="lg" size="38">
-          <v-icon icon="mdi-calendar-month-outline" />
-        </v-avatar>
-      </template>
       <v-card-title>订阅日历</v-card-title>
       <v-card-subtitle>根据订阅生成追剧日历，支持 iCal 订阅、仪表盘与侧栏月历</v-card-subtitle>
       <template #append>
@@ -171,99 +166,79 @@ onMounted(async () => {
       </template>
     </v-card-item>
 
-    <v-divider />
-
     <v-card-text>
       <v-form ref="form" @submit.prevent="saveConfig">
-        <!-- 开关 -->
-        <div class="sc-section-title">基础设置</div>
-        <v-row dense>
-          <v-col v-for="item in SWITCHES" :key="item.key" cols="12" sm="6" lg="3">
-            <div class="sc-switch-tile" :class="{ 'sc-switch-tile--active': !!config[item.key] }">
-              <v-icon :icon="item.icon" size="20" :color="config[item.key] ? 'primary' : undefined" class="sc-switch-tile__icon" />
-              <div class="sc-switch-tile__text">
-                <div class="sc-switch-tile__title">{{ item.title }}</div>
-                <div class="sc-switch-tile__subtitle">{{ item.subtitle }}</div>
-              </div>
-              <v-switch v-model="config[item.key]" color="primary" density="compact" hide-details inset />
-            </div>
+        <v-row>
+          <v-col v-for="item in SWITCHES" :key="item.key" cols="12" md="6">
+            <v-switch v-model="config[item.key]" :label="item.title" :hint="item.subtitle" persistent-hint />
           </v-col>
         </v-row>
 
-        <!-- 参数 -->
-        <div class="sc-section-title mt-4">参数</div>
-        <v-row dense>
-          <v-col cols="12" sm="6" md="3">
+        <v-row>
+          <v-col cols="12" md="6">
             <v-text-field
               v-model="config.calname"
               label="日历名称"
-              prepend-inner-icon="mdi-format-title"
-              density="comfortable"
               hint="设备日历中显示的名称"
               persistent-hint
+              prepend-inner-icon="mdi-format-title"
             />
           </v-col>
-          <v-col cols="12" sm="6" md="3">
+          <v-col cols="12" md="6">
             <v-text-field
               v-model="config.cron"
               label="刷新周期"
-              prepend-inner-icon="mdi-timer-cog-outline"
               placeholder="0 */6 * * *"
-              density="comfortable"
-              hint="cron 表达式，留空则每 12 小时刷新"
+              hint="5 段 cron 表达式，留空每 12 小时刷新"
               persistent-hint
+              prepend-inner-icon="mdi-timer-cog-outline"
               :rules="[rules.cron]"
             />
           </v-col>
-          <v-col cols="12" sm="6" md="3">
+          <v-col cols="12" md="6">
             <v-text-field
               v-model.number="config.interval_minutes"
-              label="时间取整间隔"
+              label="时间取整间隔（分钟）"
               type="number"
-              suffix="分钟"
-              prepend-inner-icon="mdi-clock-time-four-outline"
-              density="comfortable"
               hint="推算播出时间时按此间隔向下取整"
               persistent-hint
+              prepend-inner-icon="mdi-clock-time-four-outline"
               :disabled="!config.calc_time"
               :rules="[rules.interval]"
             />
           </v-col>
-          <v-col cols="12" sm="6" md="3">
+          <v-col cols="12" md="6">
             <v-select
               v-model="config.dashboard_size"
               :items="DASHBOARD_SIZES"
               label="仪表盘默认宽度"
-              prepend-inner-icon="mdi-view-dashboard-outline"
-              density="comfortable"
               hint="仪表盘编辑模式下可再自由调整"
               persistent-hint
+              prepend-inner-icon="mdi-view-dashboard-outline"
             />
           </v-col>
         </v-row>
 
-        <!-- 订阅 -->
-        <div class="sc-section-title mt-4">日历订阅</div>
-        <v-row dense align="center">
-          <v-col cols="12" md="3">
+        <v-row>
+          <v-col cols="12">
             <v-text-field
               v-model="systemEnv.domain"
               label="访问域名"
-              prepend-inner-icon="mdi-web"
               placeholder="https://mp.example.com"
-              density="comfortable"
+              hint="外部设备访问日历使用的地址，需公网可达"
+              persistent-hint
+              prepend-inner-icon="mdi-web"
               :disabled="!systemEnv.available"
-              hide-details
             />
           </v-col>
-          <v-col cols="12" md="9">
+          <v-col cols="12">
             <v-text-field
               :model-value="systemEnv.loaded && !systemEnv.available ? '仅管理员可查看订阅链接' : displayUrl"
               label="iCal 订阅链接"
+              hint="链接包含 API 令牌，请妥善保管"
+              persistent-hint
               prepend-inner-icon="mdi-link-variant"
-              density="comfortable"
               readonly
-              hide-details
             >
               <template #append-inner>
                 <v-btn
@@ -274,24 +249,19 @@ onMounted(async () => {
                   :title="showToken ? '隐藏令牌' : '显示令牌'"
                   @click="showToken = !showToken"
                 />
-                <v-btn icon="mdi-content-copy" variant="text" size="small" title="复制链接" color="primary" @click="handleCopy" />
+                <v-btn icon="mdi-content-copy" variant="text" size="small" title="复制链接" @click="handleCopy" />
               </template>
             </v-text-field>
           </v-col>
+          <v-col cols="12">
+            <v-alert type="info" variant="tonal" density="compact">
+              <div>将 iCal 链接添加到支持订阅的日历应用（iOS/macOS 日历、Outlook、Google Calendar 等）。</div>
+              <div>未开启「推算播出时间」时，事件以全天事件显示；仅 TMDB 或 Bangumi 身份的订阅会生成日历，洗版订阅不生成。</div>
+            </v-alert>
+          </v-col>
         </v-row>
-
-        <v-alert type="info" variant="tonal" density="compact" class="mt-3">
-          <ul class="sc-tips">
-            <li>将 iCal 链接添加到支持订阅的日历应用（iOS/macOS 日历、Outlook、Google Calendar 等）。</li>
-            <li>链接包含 API 令牌，请妥善保管，防止泄露。</li>
-            <li>外部设备访问需要公网可达的域名或 IP，请按实际访问地址修改「访问域名」。</li>
-            <li>未开启「推算播出时间」时，事件以全天事件显示；只有 TMDB 或 Bangumi 身份的订阅会生成日历，洗版订阅不生成。</li>
-          </ul>
-        </v-alert>
       </v-form>
     </v-card-text>
-
-    <v-divider />
 
     <v-card-actions class="sc-config__actions">
       <v-btn variant="text" prepend-icon="mdi-download" :loading="downloading" @click="handleDownload">下载 ICS</v-btn>
@@ -304,61 +274,9 @@ onMounted(async () => {
 </template>
 
 <style scoped>
-.sc-section-title {
-  margin-block-end: 0.5rem;
-  color: rgba(var(--v-theme-on-surface), 0.6);
-  font-size: 0.8125rem;
-  font-weight: 600;
-  letter-spacing: 0.02em;
-}
-
-.sc-switch-tile {
-  display: flex;
-  align-items: center;
-  gap: 0.75rem;
-  block-size: 100%;
-  padding: 0.625rem 0.75rem;
-  border: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
-  border-radius: 10px;
-  transition: border-color 0.2s ease, background-color 0.2s ease;
-}
-
-.sc-switch-tile--active {
-  border-color: rgba(var(--v-theme-primary), 0.45);
-  background-color: rgba(var(--v-theme-primary), 0.06);
-}
-
-.sc-switch-tile__icon {
-  flex: 0 0 auto;
-}
-
-.sc-switch-tile__text {
-  flex: 1 1 auto;
-  min-inline-size: 0;
-}
-
-.sc-switch-tile__title {
-  font-size: 0.875rem;
-  font-weight: 600;
-}
-
-.sc-switch-tile__subtitle {
-  color: rgba(var(--v-theme-on-surface), 0.6);
-  font-size: 0.75rem;
-  line-height: 1.35;
-}
-
-.sc-tips {
-  margin: 0;
-  padding-inline-start: 1.125rem;
-}
-
-.sc-tips li + li {
-  margin-block-start: 0.25rem;
-}
-
 .sc-config__actions {
   flex-wrap: wrap;
-  padding: 0.75rem 1rem;
+  gap: 0.25rem;
+  padding: 0.75rem 1rem 1rem;
 }
 </style>

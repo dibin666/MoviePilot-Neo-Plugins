@@ -1,3 +1,4 @@
+import { ref } from 'vue'
 import type { RawTimeLineItem, TimeLineGroup, TimeLineItem } from '../types'
 
 export const PLUGIN_ID = 'SubscribeCal'
@@ -99,14 +100,36 @@ export function getApiBase(api: any): string {
   return base.endsWith('/') ? base : `${base}/`
 }
 
-/** 图片地址：走主程序图片缓存，Bangumi 图片走专用代理。 */
+// 与主应用一致：仅在开启「全局图片缓存」时走后端缓存
+const imageCacheEnabled = ref(false)
+let imageSettingsPromise: Promise<void> | null = null
+
+/** 读取主程序图片缓存设置（全局只请求一次）。 */
+export function ensureImageSettings(api: any): Promise<void> {
+  if (!imageSettingsPromise) {
+    imageSettingsPromise = Promise.resolve(api?.get?.('system/global', { params: { token: 'moviepilot' } }))
+      .then((result: any) => {
+        imageCacheEnabled.value = Boolean(result?.data?.GLOBAL_IMAGE_CACHE)
+      })
+      .catch(() => {
+        imageCacheEnabled.value = false
+      })
+  }
+  return imageSettingsPromise
+}
+
+/** 图片地址：与主应用 getDisplayImageUrl 规则一致。 */
 export function getImageUrl(api: any, url?: string | null): string {
   if (!url) return ''
   if (!/^https?:\/\//i.test(url)) return url
   const encoded = encodeURIComponent(url)
   const base = getApiBase(api)
-  if (/(^|\.)lain\.bgm\.tv$/i.test(safeHostname(url))) return `${base}system/img/1?imgurl=${encoded}&cache=true`
-  return `${base}system/cache/image?url=${encoded}`
+  const useCache = imageCacheEnabled.value
+  if (/(^|\.)lain\.bgm\.tv$/i.test(safeHostname(url)))
+    return `${base}system/img/1?imgurl=${encoded}${useCache ? '&cache=true' : ''}`
+  if (useCache) return `${base}system/cache/image?url=${encoded}`
+  if (url.includes('doubanio.com')) return `${base}system/img/0?imgurl=${encoded}`
+  return url
 }
 
 function safeHostname(url: string): string {
@@ -170,7 +193,7 @@ export function getDaypartColor(item: TimeLineItem): string {
   if (hour >= 6 && hour < 12) return 'warning'
   if (hour >= 12 && hour < 18) return 'info'
   if (hour >= 18 && hour < 23) return 'primary'
-  return '#7E57C2'
+  return '#3949AB'
 }
 
 /** 播出时段文本。 */

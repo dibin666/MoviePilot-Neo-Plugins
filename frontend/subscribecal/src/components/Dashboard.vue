@@ -3,7 +3,7 @@ import { computed, nextTick, onActivated, onDeactivated, onMounted, reactive, re
 import CalendarEvent from './cards/CalendarEvent.vue'
 import DayEventsDialog from './cards/DayEventsDialog.vue'
 import type { TimeLineGroup, TimeLineItem } from '../types'
-import { daysFromToday, groupByDate, normalizeItems, openMediaDetail, PLUGIN_ID, toDateKey } from '../utils/calendar'
+import { daysFromToday, ensureImageSettings, groupByDate, normalizeItems, openMediaDetail, PLUGIN_ID, toDateKey } from '../utils/calendar'
 
 const props = defineProps({
   config: {
@@ -295,6 +295,7 @@ watch(
 
 // 初始化：预取今天前 10 天、后 7 天的数据
 onMounted(async () => {
+  void ensureImageSettings(props.api)
   await fetchTimelineGroups(10, 7)
   loadingState.initial = false
   await centerTimelineItem()
@@ -326,11 +327,11 @@ onDeactivated(() => {
     </v-card-item>
 
     <v-card-text class="sc-dashboard__body">
-      <div v-if="loadingState.initial" class="sc-dashboard__state">
+      <div v-if="loadingState.initial" class="sc-dashboard__state" data-layout-size-source>
         <v-progress-circular indeterminate color="primary" />
       </div>
 
-      <div v-else-if="!displayedGroups.length" class="sc-dashboard__state text-medium-emphasis">
+      <div v-else-if="!displayedGroups.length" class="sc-dashboard__state text-medium-emphasis" data-layout-size-source>
         <v-icon :icon="loadingState.error ? 'mdi-alert-circle-outline' : 'mdi-calendar-blank-outline'" size="32" />
         <span>{{ loadingState.error ? '日历数据加载失败' : '近期没有播出的订阅' }}</span>
       </div>
@@ -345,7 +346,8 @@ onDeactivated(() => {
         @scroll="handleTimelineScroll"
         @wheel="handleTimelineWheel"
       >
-        <div class="sc-dashboard__track">
+        <!-- 声明真实尺寸源，NEO 仪表盘据此自动调整卡片高度 -->
+        <div class="sc-dashboard__track" data-layout-size-source>
           <v-timeline direction="horizontal" align="center" line-color="primary" class="sc-timeline">
             <v-timeline-item
               v-for="(group, index) in displayedGroups"
