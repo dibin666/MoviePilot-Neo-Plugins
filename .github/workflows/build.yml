@@ -7,8 +7,13 @@ on:
         type: string
         description: 'Comma-separated list of plugin paths to build (optional)'
   push:
+    branches:
+      - main
     paths:
       - 'frontend/**/package.json'
+
+permissions:
+  contents: write
 
 jobs:
   build:
