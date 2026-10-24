@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { computed, nextTick, onActivated, onMounted, onDeactivated, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onActivated, onDeactivated, onMounted, reactive, ref, watch } from 'vue'
 import CalendarEvent from './cards/CalendarEvent.vue'
-import type { TimeLineGroup } from '../types'
-
+import DayEventsDialog from './cards/DayEventsDialog.vue'
+import type { TimeLineGroup, TimeLineItem } from '../types'
+import { daysFromToday, groupByDate, normalizeItems, openMediaDetail, PLUGIN_ID, toDateKey } from '../utils/calendar'
 
 const props = defineProps({
   config: {
@@ -19,7 +20,6 @@ const props = defineProps({
   },
 })
 
-
 const TIMELINE_TARGET_SELECTORS = [
   '.v-timeline-divider__dot',
   '.v-timeline-item__dot',
@@ -28,13 +28,13 @@ const TIMELINE_TARGET_SELECTORS = [
   '.v-timeline-divider__inner-dot',
 ]
 
-
-// 保存完整时间轴数据；真正渲染的范围由 computed 决定
-const timelineGroups = reactive<TimeLineGroup[]>([])
+// 已加载的全部条目（按 uid 去重）
+const itemMap = reactive(new Map<string, TimeLineItem>())
 
 const loadingState = reactive({
   initial: true,
   future: false,
+  error: false,
 })
 
 const viewState = reactive({
@@ -44,373 +44,192 @@ const viewState = reactive({
 
 const timelineContainerRef = ref<HTMLElement | null>(null)
 
-// 用于区分“用户触发的滚动”与“程序为了居中/校正触发的滚动”
+// 区分“用户触发的滚动”与“程序居中触发的滚动”
 const scrollState = reactive({
   pointerIntent: false,
   suppressTracking: false,
 })
 
-// before / after 表示已经向接口请求过的时间范围，不等于当前可见范围
+// 已经向接口请求过的时间范围
 const loadedRange = reactive({
   before: 0,
   after: 0,
 })
 
+// 当天详情弹窗
+const dialog = reactive({
+  show: false,
+  date: '',
+  items: [] as TimeLineItem[],
+})
+
 let suppressScrollTrackingTimer: ReturnType<typeof setTimeout> | null = null
 let restoreScrollBehaviorTimer: ReturnType<typeof setTimeout> | null = null
-let fixedBaseIndex = -1 // 用户接管滚动后锁定基准索引，避免后续增量加载导致视觉中心漂移
+// 用户接管滚动后锁定基准索引，避免增量加载导致视觉中心漂移
+let fixedBaseIndex = -1
 
-// 将 Date 转换成本地时区下的 YYYY-MM-DD。
-// 不能直接使用 toISOString()，否则 UTC 偏移可能让本地日期跨天。
-function getLocalISODateString(date: Date = new Date()): string {
-  const offset = date.getTimezoneOffset() * 60000
-  return new Date(date.getTime() - offset).toISOString().slice(0, 10)
-}
+const title = computed(() => props.config?.attrs?.title || '订阅日历')
 
-// 解析后端返回的 UTC 时间字符串，格式固定为 20250101T123456Z。
-// 格式非法时返回 null，由上层忽略该条坏数据，保持原有容错行为。
-function parseUTCDateTime(dateStr: string): Date | null {
-  if (!/^\d{8}T\d{6}Z$/.test(dateStr)) {
-    console.warn(`Invalid date format: ${dateStr}`)
-    return null
-  }
+const timelineGroups = computed<TimeLineGroup[]>(() => groupByDate(Array.from(itemMap.values())))
 
-  const year = Number(dateStr.slice(0, 4))
-  const month = Number(dateStr.slice(4, 6)) - 1
-  const day = Number(dateStr.slice(6, 8))
-  const hour = Number(dateStr.slice(9, 11))
-  const minute = Number(dateStr.slice(11, 13))
-  const second = Number(dateStr.slice(13, 15))
-
-  return new Date(Date.UTC(year, month, day, hour, minute, second))
-}
-
-function getTodayStart(): Date {
-  const today = new Date()
-  return new Date(today.getFullYear(), today.getMonth(), today.getDate())
-}
-
-// 将接口返回的原始事件列表按“本地日期”归组
-// 分组依据使用本地日期，而不是 UTC 日期，避免晚间/凌晨事件被归到错误日期
-// dtstart / dtend 统一转换为 Date
-function normalizeGroups(items: any[]): TimeLineGroup[] {
-  const groupedByDate = new Map<string, TimeLineGroup>()
-
-  items.forEach(item => {
-    const startDate = parseUTCDateTime(item.dtstart)
-    if (!startDate) {
-      return
-    }
-
-    const groupDate = getLocalISODateString(startDate)
-    const endDate = parseUTCDateTime(item.dtend)
-    const normalizedItem = {
-      ...item,
-      dtstart: startDate,
-      ...(endDate ? { dtend: endDate } : {}),
-    }
-
-    if (!groupedByDate.has(groupDate)) {
-      groupedByDate.set(groupDate, { date: groupDate, items: [] })
-    }
-
-    groupedByDate.get(groupDate)!.items.push(normalizedItem)
-  })
-
-  return Array.from(groupedByDate.values()).sort(
-    (left, right) => new Date(left.date).getTime() - new Date(right.date).getTime()
-  )
-}
-
-// 以 date 为唯一键合并分组，避免接口请求范围重叠时同一天重复插入
-function dedupeGroupsByDate(groups: TimeLineGroup[]): TimeLineGroup[] {
-  const uniqueGroupMap = new Map<string, TimeLineGroup>()
-
-  groups.forEach(group => {
-    if (!uniqueGroupMap.has(group.date)) {
-      uniqueGroupMap.set(group.date, group)
-    }
-  })
-
-  return Array.from(uniqueGroupMap.values())
-}
-
-function mergeTimelineGroups(groups: TimeLineGroup[], position: 'before' | 'after') {
-  if (!groups.length) {
-    return
-  }
-
-  const mergedSource = position === 'before'
-    ? [...groups, ...timelineGroups]
-    : [...timelineGroups, ...groups]
-
-  timelineGroups.splice(0, timelineGroups.length, ...dedupeGroupsByDate(mergedSource))
-}
-
-
-// 接口请求
+// 请求接口并合并结果
 async function fetchTimelineGroups(beforeDays: number, afterDays: number) {
   try {
-    const response: any[] = await props.api.get('plugin/SubscribeCal/grouped_events', {
+    const response = await props.api.get(`plugin/${PLUGIN_ID}/grouped_events`, {
       params: { before_days: beforeDays, after_days: afterDays },
     })
+    normalizeItems(response).forEach(item => itemMap.set(item.uid, item))
+    loadedRange.before = Math.max(loadedRange.before, beforeDays)
+    loadedRange.after = Math.max(loadedRange.after, afterDays)
+    loadingState.error = false
+  } catch (error) {
+    console.error(error)
+    loadingState.error = true
+  }
+}
 
-    const normalizedGroups = normalizeGroups(response)
-
-    if (beforeDays > loadedRange.before) {
-      mergeTimelineGroups(normalizedGroups, 'before')
-      loadedRange.before = beforeDays
-    }
-
-    if (afterDays > loadedRange.after) {
-      mergeTimelineGroups(normalizedGroups, 'after')
-      loadedRange.after = afterDays
-    }
+// 主应用按 refresh 周期刷新配置时，静默重新拉取已加载范围
+async function silentRefresh() {
+  if (!props.allowRefresh || loadingState.initial) return
+  try {
+    const response = await props.api.get(`plugin/${PLUGIN_ID}/grouped_events`, {
+      params: { before_days: loadedRange.before, after_days: loadedRange.after },
+    })
+    itemMap.clear()
+    normalizeItems(response).forEach(item => itemMap.set(item.uid, item))
   } catch (error) {
     console.error(error)
   }
 }
 
 async function loadMoreFutureGroups() {
-  if (loadingState.future) {
-    return
-  }
-
+  if (loadingState.future || loadedRange.after >= 120) return
   loadingState.future = true
   try {
-    await fetchTimelineGroups(loadedRange.before, loadedRange.after + 5)
+    await fetchTimelineGroups(loadedRange.before, loadedRange.after + 7)
   } finally {
     loadingState.future = false
   }
 }
 
-
-// 计算“基准日期”所在索引
-// 主动滚动后，固定使用 fixedBaseIndex，避免 displayedGroups 重新计算后基准漂移
-// 默认优先今天, 今天没有事件时，回退到最近未来日期, 没有未来数据时，退回第一个分组
+// 基准日期索引：默认今天，今天无事件时回退到最近的未来日期
 function getBaseIndex(groups: TimeLineGroup[]): number {
-  if (!groups.length) {
-    return -1
-  }
+  if (!groups.length) return -1
+  if (viewState.userScrolled && fixedBaseIndex >= 0) return fixedBaseIndex
 
-  if (viewState.userScrolled && fixedBaseIndex >= 0) {
-    return fixedBaseIndex
-  }
+  const todayKey = toDateKey()
+  const todayIndex = groups.findIndex(group => group.date === todayKey)
+  if (todayIndex !== -1) return todayIndex
 
-  const todayString = getLocalISODateString()
-  const todayIndex = groups.findIndex(group => group.date === todayString)
-  if (todayIndex !== -1) {
-    return todayIndex
-  }
-
-  const todayStart = getTodayStart()
-  const futureIndex = groups.findIndex(group => new Date(group.date) >= todayStart)
-
-  return futureIndex !== -1 ? futureIndex : 0
+  const futureIndex = groups.findIndex(group => group.date >= todayKey)
+  return futureIndex !== -1 ? futureIndex : groups.length - 1
 }
 
-// 首次自动居中时按“离今天最近的日期”选目标
-// 与 getBaseIndex 的职责不同：这里追求视觉居中目标，而不是裁剪基准索引
+// 首次居中目标：离今天最近的日期
 function getTargetGroupDate(groups: TimeLineGroup[]): string | null {
-  if (!groups.length) {
-    return null
-  }
-
-  const todayString = getLocalISODateString()
-  const todayTime = new Date(todayString).getTime()
-
-  return groups.reduce((nearestGroup, group) => {
-    if (group.date === todayString) {
-      return group
-    }
-
-    const nearestDiff = Math.abs(new Date(nearestGroup.date).getTime() - todayTime)
-    const currentDiff = Math.abs(new Date(group.date).getTime() - todayTime)
-    return currentDiff < nearestDiff ? group : nearestGroup
-  }).date
+  if (!groups.length) return null
+  return groups.reduce((nearest, group) =>
+    Math.abs(daysFromToday(group.date)) < Math.abs(daysFromToday(nearest.date)) ? group : nearest,
+  ).date
 }
 
-// 优先查找时间轴真实节点（圆点/分隔节点）作为居中锚点
 function getTimelineTargetElement(targetDate: string): HTMLElement | null {
   const container = timelineContainerRef.value
-  if (!container) {
-    return null
-  }
-
-  const timelineItem = container.querySelector<HTMLElement>(`.timeline-group-item[data-group-date="${targetDate}"]`)
-  if (!timelineItem) {
-    return null
-  }
-
+  if (!container) return null
+  const timelineItem = container.querySelector<HTMLElement>(`.sc-timeline-item[data-group-date="${targetDate}"]`)
+  if (!timelineItem) return null
   for (const selector of TIMELINE_TARGET_SELECTORS) {
-    const targetElement = timelineItem.querySelector<HTMLElement>(selector)
-    if (targetElement) {
-      return targetElement
-    }
+    const target = timelineItem.querySelector<HTMLElement>(selector)
+    if (target) return target
   }
-
-  return timelineItem.querySelector<HTMLElement>(`.timeline-center-anchor[data-group-date-anchor="${targetDate}"]`)
+  return timelineItem.querySelector<HTMLElement>('.sc-timeline-anchor')
 }
 
-function getTimelineTargetCenter(targetElement: HTMLElement, container: HTMLElement): number {
-  const targetRect = targetElement.getBoundingClientRect()
-  const containerRect = container.getBoundingClientRect()
-  return targetRect.left - containerRect.left + container.scrollLeft + targetRect.width / 2
-}
-
-// 在程序主动滚动期间短暂关闭滚动跟踪, 用于区分“自动居中/校正”与“用户接管滚动”
 function holdScrollTracking(duration = 180) {
   scrollState.suppressTracking = true
-
-  if (suppressScrollTrackingTimer) {
-    clearTimeout(suppressScrollTrackingTimer)
-  }
-
+  if (suppressScrollTrackingTimer) clearTimeout(suppressScrollTrackingTimer)
   suppressScrollTrackingTimer = setTimeout(() => {
     scrollState.suppressTracking = false
     suppressScrollTrackingTimer = null
   }, duration)
 }
 
-function scrollTargetToCenter(targetElement: HTMLElement, container: HTMLElement) {
+function scrollTargetToCenter(target: HTMLElement, container: HTMLElement) {
   const maxScrollLeft = Math.max(0, container.scrollWidth - container.clientWidth)
-  if (maxScrollLeft <= 0) {
-    return
-  }
+  if (maxScrollLeft <= 0) return
 
-  const targetCenter = getTimelineTargetCenter(targetElement, container)
-  const nextScrollLeft = targetCenter - container.clientWidth / 2
-  const clampedScrollLeft = Math.min(Math.max(0, nextScrollLeft), maxScrollLeft)
+  const targetRect = target.getBoundingClientRect()
+  const containerRect = container.getBoundingClientRect()
+  const targetCenter = targetRect.left - containerRect.left + container.scrollLeft + targetRect.width / 2
+  const nextScrollLeft = Math.min(Math.max(0, targetCenter - container.clientWidth / 2), maxScrollLeft)
 
-  if (restoreScrollBehaviorTimer) {
-    clearTimeout(restoreScrollBehaviorTimer)
-  }
-
+  if (restoreScrollBehaviorTimer) clearTimeout(restoreScrollBehaviorTimer)
   holdScrollTracking()
   container.style.scrollBehavior = 'auto'
-  container.scrollTo({
-    left: clampedScrollLeft,
-    behavior: 'auto',
-  })
-
+  container.scrollTo({ left: nextScrollLeft, behavior: 'auto' })
   restoreScrollBehaviorTimer = setTimeout(() => {
     container.style.scrollBehavior = ''
     restoreScrollBehaviorTimer = null
   }, 0)
 }
 
-// 第一次滚动先把目标大致拉到中间
-// 等布局在滚动后稳定后，再取一次真实节点位置做二次校正
+// 先大致居中，布局稳定后再二次校正
 async function centerTimelineItem() {
-  if (viewState.hasCenteredInitialItem) {
-    return
-  }
-
+  if (viewState.hasCenteredInitialItem) return
   await nextTick()
-
   requestAnimationFrame(() => {
-    requestAnimationFrame(async () => {
-      const container = timelineContainerRef.value
+    requestAnimationFrame(() => {
       const targetDate = getTargetGroupDate(displayedGroups.value)
-      if (!container || !targetDate) {
-        return
-      }
-
-      const initialTarget = getTimelineTargetElement(targetDate)
-      if (!initialTarget) {
-        return
-      }
-
-      await nextTick()
-
+      const container = timelineContainerRef.value
+      if (!container || !targetDate) return
+      const first = getTimelineTargetElement(targetDate)
+      if (!first) return
+      scrollTargetToCenter(first, container)
       requestAnimationFrame(() => {
-        const alignedTarget = getTimelineTargetElement(targetDate)
-        const alignedContainer = timelineContainerRef.value
-        if (!alignedTarget || !alignedContainer) {
-          return
-        }
-
-        scrollTargetToCenter(alignedTarget, alignedContainer)
-
-        requestAnimationFrame(() => {
-          const correctedTarget = getTimelineTargetElement(targetDate)
-          const correctedContainer = timelineContainerRef.value
-          if (!correctedTarget || !correctedContainer) {
-            return
-          }
-
-          scrollTargetToCenter(correctedTarget, correctedContainer)
-          viewState.hasCenteredInitialItem = true
-        })
+        const corrected = getTimelineTargetElement(targetDate)
+        const correctedContainer = timelineContainerRef.value
+        if (!corrected || !correctedContainer) return
+        scrollTargetToCenter(corrected, correctedContainer)
+        viewState.hasCenteredInitialItem = true
       })
     })
   })
 }
 
-
-// mergeTimelineGroups 理论上已完成去重；这里再做一次按日期归并
-// 作为渲染层的兜底，防止后续维护时重复分组进入模板
-const uniqueGroups = computed(() => dedupeGroupsByDate(timelineGroups))
-
-// 初始阶段只展示“全部已加载的过去 + 基准点附近有限未来”
-// 以降低首屏密度；一旦用户主动滚动，视为用户接管视野范围
+// 初始只展示“已加载的过去 + 基准点后 4 组”，用户滚动后展示全部
 const displayedGroups = computed(() => {
-  const groups = uniqueGroups.value
+  const groups = timelineGroups.value
   const baseIndex = getBaseIndex(groups)
-  if (baseIndex === -1) {
-    return []
-  }
-
-  if (viewState.userScrolled) {
-    return groups
-  }
-
-  const endIndex = Math.min(groups.length - 1, baseIndex + 4)
-  return groups.slice(0, endIndex + 1)
+  if (baseIndex === -1) return []
+  if (viewState.userScrolled) return groups
+  return groups.slice(0, Math.min(groups.length - 1, baseIndex + 4) + 1)
 })
 
-
 function getStatusColor(group: TimeLineGroup): string {
-  const today = new Date()
-  const [year, month, day] = group.date.split('-').map(Number)
-  const eventDate = new Date(year, month - 1, day)
-  const diffDays = Math.ceil((eventDate.getTime() - today.getTime()) / (1000 * 60 * 60 * 24))
-
-  if (eventDate < new Date(today.getFullYear(), today.getMonth(), today.getDate())) {
-    return '#CCCCCC'
-  }
-
-  if (diffDays === 0) {
-    return '#66BB6A'
-  }
-
-  if (diffDays <= 3) {
-    return '#FFC107'
-  }
-
-  return '#FF6D00'
+  const diff = daysFromToday(group.date)
+  if (diff < 0) return 'rgba(var(--v-theme-on-surface), 0.28)'
+  if (diff === 0) return 'success'
+  if (diff <= 3) return 'warning'
+  return 'primary'
 }
 
 function getTimelineItemSize(group: TimeLineGroup): string {
-  if (group.items.length === 1) {
-    return 'x-small'
-  }
-
-  if (group.items.length <= 4) {
-    return 'small'
-  }
-
-  return 'regular'
+  if (group.items.length === 1) return 'x-small'
+  if (group.items.length <= 4) return 'small'
+  return 'default'
 }
 
+function getDateLabel(date: string): string {
+  const diff = daysFromToday(date)
+  if (diff === 0) return '今天'
+  if (diff === 1) return '明天'
+  if (diff === -1) return '昨天'
+  return date.slice(5)
+}
 
-// 事件处理
 function markUserScrolled() {
-  if (viewState.userScrolled) {
-    return
-  }
-
-  fixedBaseIndex = getBaseIndex(uniqueGroups.value)
+  if (viewState.userScrolled) return
+  fixedBaseIndex = getBaseIndex(timelineGroups.value)
   viewState.userScrolled = true
 }
 
@@ -424,191 +243,208 @@ function clearTimelinePointerIntent() {
 
 function handleTimelineScroll() {
   const container = timelineContainerRef.value
-  if (!container || scrollState.suppressTracking) {
-    return
-  }
-
+  if (!container || scrollState.suppressTracking) return
   if (scrollState.pointerIntent) {
     markUserScrolled()
     scrollState.pointerIntent = false
   }
-
   const distanceToRight = container.scrollWidth - container.clientWidth - container.scrollLeft
-  if (distanceToRight <= 200) {
-    void loadMoreFutureGroups()
-  }
+  if (distanceToRight <= 200) void loadMoreFutureGroups()
 }
 
-// 将鼠标滚轮的纵向输入映射为横向滚动
+// 鼠标滚轮纵向输入映射为横向滚动
 function handleTimelineWheel(event: WheelEvent) {
   const container = timelineContainerRef.value
-  if (!container) {
-    return
-  }
-
+  if (!container || container.scrollWidth <= container.clientWidth) return
+  const delta = Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : event.deltaY
+  if (!delta) return
   markUserScrolled()
   scrollState.pointerIntent = false
   event.preventDefault()
-  container.scrollLeft += event.deltaY
+  container.scrollLeft += delta
+  handleTimelineScroll()
 }
 
+function openDay(group: TimeLineGroup) {
+  dialog.date = group.date
+  dialog.items = group.items
+  dialog.show = true
+}
 
-// 生命周期与侦听
+function handleOpenMedia(item: TimeLineItem) {
+  dialog.show = false
+  openMediaDetail(item)
+}
+
+function openMonthView() {
+  window.location.hash = `/plugin-app/${PLUGIN_ID}/main`
+}
+
 watch(
   displayedGroups,
   async groups => {
-    if (!loadingState.initial && groups.length) {
-      await centerTimelineItem()
-    }
+    if (!loadingState.initial && groups.length) await centerTimelineItem()
   },
-  { flush: 'post' }
+  { flush: 'post' },
 )
 
-// 初始化：预取今天前 10 天、后 5 天的数据
+watch(
+  () => props.config,
+  () => void silentRefresh(),
+)
+
+// 初始化：预取今天前 10 天、后 7 天的数据
 onMounted(async () => {
-  await fetchTimelineGroups(10, 5)
+  await fetchTimelineGroups(10, 7)
   loadingState.initial = false
   await centerTimelineItem()
 })
 
 onActivated(async () => {
-  if (!viewState.hasCenteredInitialItem) {
-    await centerTimelineItem()
-  }
+  if (!viewState.hasCenteredInitialItem) await centerTimelineItem()
 })
 
 onDeactivated(() => {
-  // 重置初始化状态
   viewState.hasCenteredInitialItem = false
 })
 </script>
 
 <template>
-  <div class="dashboard-widget">
-    <!-- 使用 v-hover 实现悬停效果 -->
-    <v-hover>
-      <template #default="{ isHovering, props: hoverProps }">
-        <v-card v-bind="hoverProps">
-          <v-card-item v-if="config?.attrs?.title">
-            <v-card-title>{{ config?.attrs?.title }}</v-card-title>
-          </v-card-item>
-          <v-card-text>
-            <!-- 加载中状态 -->
-            <div v-if="loadingState.initial" class="d-flex justify-center align-center py-4">
-              <v-progress-circular indeterminate color="primary"></v-progress-circular>
-            </div>
-
-            <!-- 时间轴内容 -->
-            <div
-              v-else
-              ref="timelineContainerRef"
-              class="timeline-container"
-              @pointerdown="handleTimelinePointerDown"
-              @pointerup="clearTimelinePointerIntent"
-              @pointercancel="clearTimelinePointerIntent"
-              @scroll="handleTimelineScroll"
-              @wheel="handleTimelineWheel"
-            >
-              <div class="timeline-track">
-                <!-- 横向时间轴 -->
-                <v-timeline
-                  direction="horizontal"
-                  align="center"
-                  line-color="primary"
-                  class="dense-timeline"
-                >
-                  <v-timeline-item
-                    v-for="(group, index) in displayedGroups"
-                    :key="group.date"
-                    class="timeline-group-item"
-                    :data-group-date="group.date"
-                    :dot-color="getStatusColor(group)"
-                    :size="getTimelineItemSize(group)"
-                  >
-                    <template #opposite>
-                      {{ group.date }}
-                    </template>
-
-                    <!-- 用于自动居中计算的隐藏锚点，不参与实际交互 -->
-                    <div
-                      class="timeline-center-anchor"
-                      :data-group-date-anchor="group.date"
-                      aria-hidden="true"
-                    ></div>
-
-                    <CalendarEvent
-                      :events="group"
-                      :position="index % 2 === 0 ? 'top' : 'bottom'"
-                    />
-                  </v-timeline-item>
-                </v-timeline>
-              </div>
-            </div>
-          </v-card-text>
-
-          <!-- 只在悬停时显示拖拽图标 -->
-          <div v-show="isHovering" class="absolute right-5 top-5">
-            <v-icon class="cursor-move">mdi-drag</v-icon>
-          </div>
-        </v-card>
+  <v-card class="sc-dashboard dashboard-grid-fill">
+    <v-card-item class="sc-dashboard__header">
+      <v-card-title>{{ title }}</v-card-title>
+      <template #append>
+        <v-btn
+          class="dashboard-grid-no-drag"
+          icon="mdi-calendar-month-outline"
+          size="small"
+          variant="text"
+          title="打开月历"
+          @click="openMonthView"
+        />
       </template>
-    </v-hover>
-  </div>
+    </v-card-item>
+
+    <v-card-text class="sc-dashboard__body">
+      <div v-if="loadingState.initial" class="sc-dashboard__state">
+        <v-progress-circular indeterminate color="primary" />
+      </div>
+
+      <div v-else-if="!displayedGroups.length" class="sc-dashboard__state text-medium-emphasis">
+        <v-icon :icon="loadingState.error ? 'mdi-alert-circle-outline' : 'mdi-calendar-blank-outline'" size="32" />
+        <span>{{ loadingState.error ? '日历数据加载失败' : '近期没有播出的订阅' }}</span>
+      </div>
+
+      <div
+        v-else
+        ref="timelineContainerRef"
+        class="sc-dashboard__scroller dashboard-grid-no-drag"
+        @pointerdown="handleTimelinePointerDown"
+        @pointerup="clearTimelinePointerIntent"
+        @pointercancel="clearTimelinePointerIntent"
+        @scroll="handleTimelineScroll"
+        @wheel="handleTimelineWheel"
+      >
+        <div class="sc-dashboard__track">
+          <v-timeline direction="horizontal" align="center" line-color="primary" class="sc-timeline">
+            <v-timeline-item
+              v-for="(group, index) in displayedGroups"
+              :key="group.date"
+              class="sc-timeline-item"
+              :data-group-date="group.date"
+              :dot-color="getStatusColor(group)"
+              :size="getTimelineItemSize(group)"
+            >
+              <template #opposite>
+                <span class="sc-timeline-date" :class="{ 'sc-timeline-date--today': daysFromToday(group.date) === 0 }">
+                  {{ getDateLabel(group.date) }}
+                </span>
+              </template>
+
+              <div class="sc-timeline-anchor" aria-hidden="true" />
+
+              <CalendarEvent :events="group" :api="api" :position="index % 2 === 0 ? 'top' : 'bottom'" @select="openDay" />
+            </v-timeline-item>
+          </v-timeline>
+        </div>
+      </div>
+    </v-card-text>
+
+    <DayEventsDialog
+      v-model="dialog.show"
+      :date="dialog.date"
+      :items="dialog.items"
+      :api="api"
+      @open-media="handleOpenMedia"
+    />
+  </v-card>
 </template>
 
 <style scoped>
-.dashboard-widget {
+.sc-dashboard {
   display: flex;
   flex-direction: column;
-  height: 100%; /* 确保占满父容器 */
+  block-size: 100%;
+  min-block-size: 0;
 }
 
-.v-card-text {
+.sc-dashboard__header {
+  padding-block-end: 0;
+}
+
+.sc-dashboard__body {
   display: flex;
+  flex: 1 1 auto;
   flex-direction: column;
-  flex-grow: 1; /* 占据剩余空间 */
+  justify-content: center;
+  min-block-size: 0;
   overflow: hidden;
 }
 
-.timeline-container {
-  flex-grow: 1; /* 自动扩展以填满可用空间 */
+.sc-dashboard__state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  min-block-size: 240px;
+}
+
+.sc-dashboard__scroller {
+  flex: 1 1 auto;
   overflow-x: auto;
   overflow-y: hidden;
+  overscroll-behavior-x: contain;
   scroll-behavior: smooth;
+  scrollbar-width: thin;
 }
 
-.timeline-track {
+.sc-dashboard__track {
   display: inline-flex;
-  min-width: max-content;
-  padding: 0;
+  min-inline-size: max-content;
 }
 
-:deep(.v-timeline.dense-timeline) {
-  display: inline-flex;
-  flex-wrap: nowrap;
-  width: max-content;
-  min-width: max-content;
-}
-
-:deep(.timeline-group-item) {
+.sc-timeline-item {
   position: relative;
-  flex: 0 0 auto;
-  min-width: 0;
 }
 
-:deep(.timeline-center-anchor) {
+.sc-timeline-anchor {
   position: absolute;
-  left: 50%;
-  top: 0;
-  width: 0;
-  height: 0;
-  transform: translateX(-50%);
+  inset-block-start: 0;
+  inset-inline-start: 50%;
+  block-size: 0;
+  inline-size: 0;
   pointer-events: none;
 }
 
-.timeline-card {
-  height: 100%;
-  display: flex;
-  flex-direction: column;
+.sc-timeline-date {
+  color: rgba(var(--v-theme-on-surface), 0.7);
+  font-size: 0.8125rem;
+  white-space: nowrap;
+}
+
+.sc-timeline-date--today {
+  color: rgb(var(--v-theme-success));
+  font-weight: 700;
 }
 </style>

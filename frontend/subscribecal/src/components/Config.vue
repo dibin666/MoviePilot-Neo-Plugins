@@ -1,5 +1,7 @@
 <script setup lang="ts">
-import { ref, reactive, onMounted } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
+import { PLUGIN_ID } from '../utils/calendar'
+import { buildSubscribeUrl, copyText, downloadIcs, loadSystemEnv, useHostToast } from '../utils/actions'
 
 const props = defineProps({
   api: {
@@ -8,419 +10,355 @@ const props = defineProps({
   },
   initialConfig: {
     type: Object,
-    default: () => ({})
-  }
-})
-
-const emit = defineEmits(['close', 'save'])
-
-// 插件默认配置
-const defaultConfig = reactive({
-  enabled: false,
-  calc_time: 0,
-  onlyonce: false,
-  interval_minutes: 15,
-  calname: '追剧日历',
-  cron: '',
-  dashboard_size : 6,
-})
-
-const config = reactive({ ...defaultConfig })
-
-const isFormValid = ref(true)
-const form = ref<{ resetValidation: () => void } | null>(null)
-const error = ref<string | null>(null)
-const successMessage = ref<string | null>(null)
-const saving = ref(false)
-
-// 系统设置项
-const SystemSettings = ref<any>({
-  // 基础设置
-  Basic: {
-    APP_DOMAIN: null,
-    API_TOKEN: null,
+    default: () => ({}),
   },
 })
 
-// 下载ics文件
-async function downloadICS() {
-  try {
-    const response = await props.api.get('plugin/SubscribeCal/download/calendar.ics', {
-      responseType: 'text',
-    })
-    console.log(response)
-    const blob = new Blob([response], { type: 'text/calendar' })
-    const url = window.URL.createObjectURL(blob)
-    const link = document.createElement('a')
-    link.href = url
-    link.setAttribute('download', `${config.calname}.ics`)
-    document.body.appendChild(link)
-    link.click()
-    link.remove()
+const emit = defineEmits(['close', 'save', 'switch'])
 
-    showNotification('ICS 文件已成功下载', 'success')
-  } catch (err) {
-    console.error('ICS 文件下载失败:', err)
-    showNotification('ICS 文件下载失败', 'error')
-  }
+const toast = useHostToast()
+
+// 插件默认配置
+const defaultConfig = {
+  enabled: false,
+  onlyonce: false,
+  calc_time: false,
+  sidebar_nav: true,
+  calname: '追剧日历',
+  interval_minutes: 15,
+  cron: '',
+  dashboard_size: 6,
 }
 
-// 复制Url
-async function copyUrl() {
-  try {
-    let value = SystemSettings.value.Basic.APP_DOMAIN
-    const token = SystemSettings.value.Basic.API_TOKEN
+type PluginConfig = typeof defaultConfig
 
-    // 校验必要字段
-    if (!value) {
-      showNotification('域名未配置', 'warning')
-      return
-    }
+const config = reactive<PluginConfig>({ ...defaultConfig })
 
-    // 构建 URL
-    let baseUrl = value
-    if (!baseUrl.startsWith('http://') && !baseUrl.startsWith('https://')) {
-      baseUrl = 'http://' + baseUrl
-    }
-    const url = new URL(`${baseUrl}/api/v1/plugin/SubscribeCal/subscribe`)
-    url.searchParams.append('apikey', token)
+const DASHBOARD_SIZES = [
+  { title: '1/3 宽', value: 4 },
+  { title: '1/2 宽', value: 6 },
+  { title: '2/3 宽', value: 8 },
+  { title: '3/4 宽', value: 9 },
+  { title: '全宽', value: 12 },
+]
 
-    // 复制到剪贴板
-    await navigator.clipboard.writeText(url.toString())
-    showNotification('已复制到剪贴板！', 'success')
-  } catch (err) {
-    console.error('操作失败:', err)
-    showNotification('复制失败，请检查浏览器权限或输入内容', 'error')
-  }
-}
+const SWITCHES: { key: keyof PluginConfig; title: string; subtitle: string; icon: string }[] = [
+  { key: 'enabled', title: '启用插件', subtitle: '生成日历并开放 iCal 订阅', icon: 'mdi-power' },
+  { key: 'onlyonce', title: '立即刷新一次', subtitle: '保存后重新获取全部播出信息', icon: 'mdi-update' },
+  { key: 'calc_time', title: '推算播出时间', subtitle: '根据订阅下载记录推算具体时刻', icon: 'mdi-history' },
+  { key: 'sidebar_nav', title: '侧栏月历入口', subtitle: '在「订阅」分组显示月历页面', icon: 'mdi-dock-left' },
+]
 
-// 加载系统设置
-async function loadSystemSettings() {
-  try {
-    const result: { [key: string]: any } = await props.api.get('system/env')
-    if (result.success) {
-      // 将API返回的值赋值给SystemSettings
-      for (const sectionKey of Object.keys(SystemSettings.value) as Array<keyof typeof SystemSettings.value>) {
-        Object.keys(SystemSettings.value[sectionKey]).forEach((key: string) => {
-          if (result.data.hasOwnProperty(key)) {
-            (SystemSettings.value[sectionKey] as any)[key] = result.data[key]
-          }
-        })
-      }
-      // 判断 APP_DOMAIN 是否为空
-      if (!SystemSettings.value.Basic.APP_DOMAIN) {
-        SystemSettings.value.Basic.APP_DOMAIN = `${window.location.origin}`
-      }
-    }
-  } catch (error) {
-    console.log(error)
-  }
-}
+const form = ref<{ validate: () => Promise<{ valid: boolean }> } | null>(null)
+const saving = ref(false)
+const downloading = ref(false)
 
-// 通知状态
-const snackbar = reactive({
-  show: false,
-  text: '',
-  color: 'success',
-  timeout: 3000,
+// 订阅链接
+const systemEnv = reactive({
+  loaded: false,
+  available: false,
+  domain: '',
+  token: '',
+})
+const showToken = ref(false)
+
+const subscribeUrl = computed(() =>
+  systemEnv.available ? buildSubscribeUrl(systemEnv.domain || window.location.origin, systemEnv.token) : '',
+)
+
+const displayUrl = computed(() => {
+  if (!subscribeUrl.value) return ''
+  if (showToken.value || !systemEnv.token) return subscribeUrl.value
+  return subscribeUrl.value.replace(encodeURIComponent(systemEnv.token), '••••••')
 })
 
-// 显示通知
-function showNotification(text, color = 'success') {
-  snackbar.text = text
-  snackbar.color = color
-  snackbar.show = true
+const rules = {
+  interval: (value: unknown) => {
+    const number = Number(value)
+    return (Number.isInteger(number) && number >= 0 && number <= 1440) || '请输入 0-1440 的整数'
+  },
+  cron: (value: unknown) => {
+    const text = String(value ?? '').trim()
+    return !text || text.split(/\s+/).length === 5 || '请输入 5 段 cron 表达式，如 0 */6 * * *'
+  },
 }
 
-// 保存配置
-async function saveConfig() {
-  saving.value = true
-  error.value = null
+function normalizeConfig(): PluginConfig {
+  return {
+    ...config,
+    calname: String(config.calname || '').trim() || defaultConfig.calname,
+    cron: String(config.cron || '').trim(),
+    interval_minutes: Number(config.interval_minutes) || 0,
+    dashboard_size: Number(config.dashboard_size) || defaultConfig.dashboard_size,
+  }
+}
 
+async function saveConfig() {
+  const result = await form.value?.validate()
+  if (result && !result.valid) {
+    toast.warning('请检查配置项')
+    return
+  }
+  saving.value = true
   try {
-    emit('save', { ...config })
-    successMessage.value = '配置保存成功'
-  } catch (err) {
-    console.error('保存配置失败:', err)
-    error.value = err.message || '保存配置失败'
+    emit('save', normalizeConfig())
   } finally {
     saving.value = false
   }
 }
 
-// 重置表单
 function resetForm() {
-  Object.keys(defaultConfig).forEach(key => {
-    config[key] = defaultConfig[key]
-  })
+  Object.assign(config, defaultConfig)
+}
 
-  if (form.value) {
-    form.value.resetValidation()
+async function handleDownload() {
+  downloading.value = true
+  try {
+    await downloadIcs(props.api, config.calname)
+    toast.success('ICS 文件已下载')
+  } catch (error) {
+    console.error(error)
+    toast.error('ICS 文件下载失败，请确认插件已启用')
+  } finally {
+    downloading.value = false
   }
 }
 
-onMounted (() => {
-  // 加载初始配置
-  if (props.initialConfig) {
-    Object.keys(props.initialConfig).forEach(key => {
-      if (key in config) {
-        config[key] = props.initialConfig[key]
-      }
-    })
+async function handleCopy() {
+  if (!subscribeUrl.value) {
+    toast.warning('无法获取订阅链接，请确认当前账号为管理员')
+    return
   }
-  // 加载系统设置
-  loadSystemSettings()
+  const ok = await copyText(subscribeUrl.value)
+  if (ok) toast.success('已复制到剪贴板')
+  else toast.error('复制失败，请检查浏览器权限')
+}
+
+function openCalendar() {
+  emit('close')
+  window.location.hash = `/plugin-app/${PLUGIN_ID}/main`
+}
+
+onMounted(async () => {
+  Object.keys(defaultConfig).forEach(key => {
+    const value = props.initialConfig?.[key]
+    if (value !== undefined && value !== null) (config as any)[key] = value
+  })
+  config.calc_time = Boolean(config.calc_time)
+
+  const env = await loadSystemEnv(props.api)
+  systemEnv.loaded = true
+  if (env) {
+    systemEnv.available = true
+    systemEnv.domain = env.domain
+    systemEnv.token = env.token
+  }
 })
 </script>
 
 <template>
-  <div class="plugin-config">
-    <v-card flat class="rounded border">
-      <!-- 标题区域 -->
-      <v-card-title class="text-subtitle-1 d-flex align-center px-3 py-2 bg-primary-lighten-5">
-        <v-icon icon="mdi-cog" class="mr-2" color="primary" size="small" />
-        <span>订阅日历配置</span>
-      </v-card-title>
-      <v-card-text class="px-3 py-2">
-        <v-form ref="form" v-model="isFormValid" @submit.prevent="saveConfig">
-          <!-- 新增的选项卡组件 -->
-          <v-card flat class="rounded mb-3 border config-card">
-            <v-card-text class="px-3 py-2">
-              <v-row dense no-gutters>
-                <!-- 插件开关 -->
-                <v-col cols="12" md="4" class="pr-md-2 pb-2">
-                  <div class="setting-item d-flex align-center justify-space-between pa-3 bg-grey-lighten-3 rounded">
-                    <div class="d-flex align-center">
-                      <v-icon icon="mdi-power" size="small" :color="config.enabled ? 'info' : 'grey'" class="mr-3" />
-                      <span class="text-subtitle-2">启用插件</span>
-                    </div>
-                    <v-switch
-                      v-model="config.enabled"
-                      color="info"
-                      inset
-                      density="compact"
-                      hide-details
-                      class="small-switch"
-                    />
-                  </div>
-                </v-col>
-                <!--  -->
-                <v-col cols="12" md="4" class="pr-md-2 pb-2">
-                  <div class="setting-item d-flex align-center justify-space-between pa-3 bg-grey-lighten-3 rounded">
-                    <div class="d-flex align-center">
-                      <v-icon icon="mdi-history" size="small" :color="config.calc_time ? 'info' : 'grey'" class="mr-3" />
-                      <span class="text-subtitle-2">使用下载记录补充时间</span>
-                    </div>
-                    <v-switch
-                      v-model="config.calc_time"
-                      color="info"
-                      inset
-                      density="compact"
-                      hide-details
-                      class="small-switch"
-                    />
-                  </div>
-                </v-col>
-                <v-col cols="12" md="4" class="pr-md-2 pb-2">
-                  <div class="setting-item d-flex align-center justify-space-between pa-3 bg-grey-lighten-3 rounded">
-                    <div class="d-flex align-center">
-                      <v-icon icon="mdi-update" size="small" :color="config.enabled ? 'info' : 'grey'" class="mr-3" />
-                      <span class="text-subtitle-2">立即更新一次</span>
-                    </div>
-                    <v-switch
-                      v-model="config.onlyonce"
-                      color="info"
-                      inset
-                      density="compact"
-                      hide-details
-                      class="small-switch"
-                    />
-                  </div>
-                </v-col>
-              </v-row>
-              <!-- 文本填写区域 -->
-              <v-row no-gutters>
-                <v-col cols="12" md="3" class="pl-md-2 pb-2">
-                  <div class="setting-item d-flex align-center justify-space-between pa-3 bg-grey-lighten-3 rounded">
-                    <div class="d-flex align-center">
-                      <span class="text-subtitle-2">日历名称</span>
-                    </div>
-                    <v-text-field
-                      v-model.number="config.calname"
-                      density="compact"
-                      hide-details
-                      style="max-width: 150px"
-                    />
-                  </div>
-                </v-col>
-                <v-col cols="12" md="3" class="pl-md-2 pb-2">
-                  <div class="setting-item d-flex align-center justify-space-between pa-3 bg-grey-lighten-3 rounded">
-                    <div class="d-flex align-center">
-                      <span class="text-subtitle-2">时间取整间隔(分钟)</span>
-                    </div>
-                    <v-text-field
-                      v-model.number="config.interval_minutes"
-                      density="compact"
-                      hide-details
-                      style="max-width: 150px"
-                    />
-                  </div>
-                </v-col>
-                <v-col cols="12" md="3" class="pl-md-2 pb-2">
-                  <div class="setting-item d-flex align-center justify-space-between pa-3 bg-grey-lighten-3 rounded">
-                    <div class="d-flex align-center">
-                      <span class="text-subtitle-2">数据更新周期</span>
-                    </div>
-                    <v-text-field
-                      v-model.number="config.cron"
-                      density="compact"
-                      hide-details
-                      placeholder="留空自动"
-                      style="max-width: 150px"
-                    />
-                  </div>
-                </v-col>
-                <v-col cols="12" md="3" class="pl-md-2 pb-2">
-                  <div class="setting-item d-flex align-center justify-space-between pa-3 bg-grey-lighten-3 rounded">
-                    <div class="d-flex align-center">
-                      <span class="text-subtitle-2">仪表盘宽度</span>
-                    </div>
-                    <v-text-field
-                      v-model.number="config.dashboard_size"
-                      density="compact"
-                      hide-details
-                      placeholder="留空自动"
-                    />
-                  </div>
-                </v-col>
-              </v-row>
-            </v-card-text>
-          </v-card>
-          <!-- 下载与说明 -->
-          <v-divider class="my-4" />
-          <v-row>
-            <v-col cols="4" md="2">
-              <v-btn color="primary" :disabled="!isFormValid || saving" @click="downloadICS" :loading="saving" prepend-icon="mdi-download" variant="tonal">下载ICS文件</v-btn>
-            </v-col>
-            <v-col cols="20" md="10">
-              <!-- 输入框与按钮行 -->
-              <div class="d-flex align-center mb-2">
-                <!-- 输入框 -->
-                <v-text-field
-                  v-model="SystemSettings.Basic.APP_DOMAIN"
-                  label="iCal订阅链接"
-                  density="compact"
-                  placeholder="DOMAIN:PORT 或 IP:PORT"
-                  hide-details
-                  class="flex-grow-1"
-                />
-                <!-- 复制按钮 -->
-                <v-btn
-                  icon="mdi-content-copy"
-                  size="small"
-                  variant="text"
-                  color="primary"
-                  @click="copyUrl"
-                />
-                </div>
-            </v-col>
-          </v-row>
+  <v-card flat class="sc-config">
+    <v-card-item>
+      <template #prepend>
+        <v-avatar color="primary" variant="tonal" rounded="lg" size="38">
+          <v-icon icon="mdi-calendar-month-outline" />
+        </v-avatar>
+      </template>
+      <v-card-title>订阅日历</v-card-title>
+      <v-card-subtitle>根据订阅生成追剧日历，支持 iCal 订阅、仪表盘与侧栏月历</v-card-subtitle>
+      <template #append>
+        <v-btn icon="mdi-close" variant="text" size="small" @click="emit('close')" />
+      </template>
+    </v-card-item>
 
-          <v-alert type="info" title="iCal订阅链接:">
-            <div class="space-y-2">
-              <ul class="list-disc pl-5 space-y-1">
-                <li>链接包含API密钥，请妥善保管防止泄露⚠️⚠️</li>
-                <li>将iCal链接添加到支持订阅的日历应用（如Outlook、Google Calendar等）</li>
-                <li>服务需公网访问，请将域名替换为您的公网IP或域名</li>
-              </ul>
+    <v-divider />
+
+    <v-card-text>
+      <v-form ref="form" @submit.prevent="saveConfig">
+        <!-- 开关 -->
+        <div class="sc-section-title">基础设置</div>
+        <v-row dense>
+          <v-col v-for="item in SWITCHES" :key="item.key" cols="12" sm="6" lg="3">
+            <div class="sc-switch-tile" :class="{ 'sc-switch-tile--active': !!config[item.key] }">
+              <v-icon :icon="item.icon" size="20" :color="config[item.key] ? 'primary' : undefined" class="sc-switch-tile__icon" />
+              <div class="sc-switch-tile__text">
+                <div class="sc-switch-tile__title">{{ item.title }}</div>
+                <div class="sc-switch-tile__subtitle">{{ item.subtitle }}</div>
+              </div>
+              <v-switch v-model="config[item.key]" color="primary" density="compact" hide-details inset />
             </div>
-          </v-alert>
+          </v-col>
+        </v-row>
 
-          <v-card-actions class="px-2 py-1">
-            <v-spacer></v-spacer>
-            <v-btn color="secondary" variant="text" @click="resetForm" prepend-icon="mdi-restore" size="small">恢复默认</v-btn>
-            <v-btn color="primary" :disabled="!isFormValid || saving" @click="saveConfig" :loading="saving" prepend-icon="mdi-content-save" variant="text" size="small">保存配置</v-btn>
-            <v-btn color="grey" @click="emit('close')" prepend-icon="mdi-close" variant="text" size="small">关闭</v-btn>
-          </v-card-actions>
-        </v-form>
-      </v-card-text>
-      <!-- 通知弹窗 -->
-      <v-snackbar v-model="snackbar.show" :color="snackbar.color" :timeout="snackbar.timeout">
-        {{ snackbar.text }}
-        <template v-slot:actions>
-          <v-btn variant="text" @click="snackbar.show = false"> 关闭 </v-btn>
-        </template>
-      </v-snackbar>
-    </v-card>
-  </div>
+        <!-- 参数 -->
+        <div class="sc-section-title mt-4">参数</div>
+        <v-row dense>
+          <v-col cols="12" sm="6" md="3">
+            <v-text-field
+              v-model="config.calname"
+              label="日历名称"
+              prepend-inner-icon="mdi-format-title"
+              density="comfortable"
+              hint="设备日历中显示的名称"
+              persistent-hint
+            />
+          </v-col>
+          <v-col cols="12" sm="6" md="3">
+            <v-text-field
+              v-model="config.cron"
+              label="刷新周期"
+              prepend-inner-icon="mdi-timer-cog-outline"
+              placeholder="0 */6 * * *"
+              density="comfortable"
+              hint="cron 表达式，留空则每 12 小时刷新"
+              persistent-hint
+              :rules="[rules.cron]"
+            />
+          </v-col>
+          <v-col cols="12" sm="6" md="3">
+            <v-text-field
+              v-model.number="config.interval_minutes"
+              label="时间取整间隔"
+              type="number"
+              suffix="分钟"
+              prepend-inner-icon="mdi-clock-time-four-outline"
+              density="comfortable"
+              hint="推算播出时间时按此间隔向下取整"
+              persistent-hint
+              :disabled="!config.calc_time"
+              :rules="[rules.interval]"
+            />
+          </v-col>
+          <v-col cols="12" sm="6" md="3">
+            <v-select
+              v-model="config.dashboard_size"
+              :items="DASHBOARD_SIZES"
+              label="仪表盘默认宽度"
+              prepend-inner-icon="mdi-view-dashboard-outline"
+              density="comfortable"
+              hint="仪表盘编辑模式下可再自由调整"
+              persistent-hint
+            />
+          </v-col>
+        </v-row>
+
+        <!-- 订阅 -->
+        <div class="sc-section-title mt-4">日历订阅</div>
+        <v-row dense align="center">
+          <v-col cols="12" md="3">
+            <v-text-field
+              v-model="systemEnv.domain"
+              label="访问域名"
+              prepend-inner-icon="mdi-web"
+              placeholder="https://mp.example.com"
+              density="comfortable"
+              :disabled="!systemEnv.available"
+              hide-details
+            />
+          </v-col>
+          <v-col cols="12" md="9">
+            <v-text-field
+              :model-value="systemEnv.loaded && !systemEnv.available ? '仅管理员可查看订阅链接' : displayUrl"
+              label="iCal 订阅链接"
+              prepend-inner-icon="mdi-link-variant"
+              density="comfortable"
+              readonly
+              hide-details
+            >
+              <template #append-inner>
+                <v-btn
+                  v-if="systemEnv.token"
+                  :icon="showToken ? 'mdi-eye-off-outline' : 'mdi-eye-outline'"
+                  variant="text"
+                  size="small"
+                  :title="showToken ? '隐藏令牌' : '显示令牌'"
+                  @click="showToken = !showToken"
+                />
+                <v-btn icon="mdi-content-copy" variant="text" size="small" title="复制链接" color="primary" @click="handleCopy" />
+              </template>
+            </v-text-field>
+          </v-col>
+        </v-row>
+
+        <v-alert type="info" variant="tonal" density="compact" class="mt-3">
+          <ul class="sc-tips">
+            <li>将 iCal 链接添加到支持订阅的日历应用（iOS/macOS 日历、Outlook、Google Calendar 等）。</li>
+            <li>链接包含 API 令牌，请妥善保管，防止泄露。</li>
+            <li>外部设备访问需要公网可达的域名或 IP，请按实际访问地址修改「访问域名」。</li>
+            <li>未开启「推算播出时间」时，事件以全天事件显示；只有 TMDB 或 Bangumi 身份的订阅会生成日历，洗版订阅不生成。</li>
+          </ul>
+        </v-alert>
+      </v-form>
+    </v-card-text>
+
+    <v-divider />
+
+    <v-card-actions class="sc-config__actions">
+      <v-btn variant="text" prepend-icon="mdi-download" :loading="downloading" @click="handleDownload">下载 ICS</v-btn>
+      <v-btn variant="text" prepend-icon="mdi-calendar-month-outline" @click="openCalendar">打开月历</v-btn>
+      <v-spacer />
+      <v-btn variant="text" prepend-icon="mdi-restore" @click="resetForm">恢复默认</v-btn>
+      <v-btn color="primary" variant="flat" prepend-icon="mdi-content-save" :loading="saving" @click="saveConfig">保存</v-btn>
+    </v-card-actions>
+  </v-card>
 </template>
 
 <style scoped>
-/* 插件配置容器样式 */
-.plugin-config {
-  max-width: 80rem;
-  margin: 0 auto;
-  padding: 0.5rem;
+.sc-section-title {
+  margin-block-end: 0.5rem;
+  color: rgba(var(--v-theme-on-surface), 0.6);
+  font-size: 0.8125rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
 }
 
-/* 主色浅化 5 级的背景颜色样式 */
-.bg-primary-lighten-5 {
-  background-color: rgba(var(--v-theme-primary), 0.07);
-}
-
-/* 通用边框样式 */
-.border {
-  border: thin solid rgba(var(--v-border-color), var(--v-border-opacity));
-}
-
-/* 设置项样式 */
-.setting-item {
-  border-radius: 8px;
-  transition: all 0.2s ease;
-  padding: 0.5rem;
-  height: 100%;
+.sc-switch-tile {
   display: flex;
   align-items: center;
+  gap: 0.75rem;
+  block-size: 100%;
+  padding: 0.625rem 0.75rem;
+  border: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
+  border-radius: 10px;
+  transition: border-color 0.2s ease, background-color 0.2s ease;
 }
 
-/* 设置项悬停样式 */
-.setting-item:hover {
-  background-color: rgba(var(--v-theme-primary), 0.03);
+.sc-switch-tile--active {
+  border-color: rgba(var(--v-theme-primary), 0.45);
+  background-color: rgba(var(--v-theme-primary), 0.06);
 }
 
-/* 确保所有列的高度一致 */
-.v-col {
-  display: flex;
-  align-items: stretch;
+.sc-switch-tile__icon {
+  flex: 0 0 auto;
 }
 
-/* 小开关组件样式，调整大小和位置 */
-.small-switch {
-  transform: scale(0.8);
-  margin-right: -8px;
-  flex-shrink: 0;
+.sc-switch-tile__text {
+  flex: 1 1 auto;
+  min-inline-size: 0;
 }
 
-/* 配置卡片样式 */
-.config-card {
-  /* 背景渐变，包含主背景和重复渐变效果 */
-  background-image: linear-gradient(to right, rgba(var(--v-theme-surface), 0.98), rgba(var(--v-theme-surface), 0.95)),
-                    repeating-linear-gradient(45deg, rgba(var(--v-theme-primary), 0.03), rgba(var(--v-theme-primary), 0.03) 10px, transparent 10px, transparent 20px);
-  background-attachment: fixed;
-  box-shadow: 0 1px 2px rgba(var(--v-border-color), 0.05) !important;
-  transition: all 0.3s ease;
+.sc-switch-tile__title {
+  font-size: 0.875rem;
+  font-weight: 600;
 }
 
-/* 配置卡片悬停样式 */
-.config-card:hover {
-  box-shadow: 0 3px 6px rgba(var(--v-border-color), 0.1) !important;
+.sc-switch-tile__subtitle {
+  color: rgba(var(--v-theme-on-surface), 0.6);
+  font-size: 0.75rem;
+  line-height: 1.35;
 }
 
-/* 副标题 2 文本样式 */
-.text-subtitle-2 {
-  font-size: 0.875rem !important;
-  font-weight: 500;
-  white-space: nowrap;
-  margin-right: 0.5rem;
+.sc-tips {
+  margin: 0;
+  padding-inline-start: 1.125rem;
+}
+
+.sc-tips li + li {
+  margin-block-start: 0.25rem;
+}
+
+.sc-config__actions {
+  flex-wrap: wrap;
+  padding: 0.75rem 1rem;
 }
 </style>
